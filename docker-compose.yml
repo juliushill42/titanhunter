@@ -1,0 +1,313 @@
+# ============================================================
+# Hunter Real Estate System — Local Development
+# docker-compose.yml
+# "Each hunt runs inside a container." — Blueprint
+# ============================================================
+
+version: '3.9'
+
+networks:
+  hunter-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:
+  kafka-data:
+  zookeeper-data:
+  redis-data:
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: hunter-postgres
+    environment:
+      POSTGRES_USER: hunter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hunter_dev_pw}
+      POSTGRES_DB: hunter_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hunter"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hunter-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: hunter-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper
+    networks:
+      - hunter-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: hunter-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - hunter-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: hunter-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: hunter-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - hunter-net
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: hunter-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Creating Hunter pipeline topics...'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.raw.leads --partitions 6 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.extraction.queue --partitions 4 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.ranking.queue --partitions 4 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.ranked.leads --partitions 4 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.export.queue --partitions 2 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.escrow.events --partitions 2 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic hunter.system.health --partitions 1 --replication-factor 1
+      echo 'Topics created.'
+      "
+    networks:
+      - hunter-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: hunter-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    networks:
+      - hunter-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Module A: Crawler Engine ──────────────────────────────
+  # Blueprint: "Spawning 43 markets = 43 containers"
+  # In K8s prod: each region spawns its own Deployment via Orchestra
+
+  crawler:
+    build:
+      context: ./modules/crawler
+      dockerfile: Dockerfile
+    container_name: hunter-crawler
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_URL: postgresql://hunter:${POSTGRES_PASSWORD:-hunter_dev_pw}@postgres:5432/hunter_db
+      REDIS_URL: redis://redis:6379
+      COUNTY_API_KEY: ${COUNTY_API_KEY:-}
+      MAX_CONCURRENT_CRAWLS: "5"
+      DEFAULT_RATE_LIMIT_RPM: "30"
+      PROXY_LIST: ${PROXY_LIST:-}
+      LOG_LEVEL: debug
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./modules/crawler:/app
+      - ./shared:/app/shared:ro
+      - /app/node_modules
+    networks:
+      - hunter-net
+    restart: unless-stopped
+    labels:
+      hunter.module: "crawler"
+      hunter.version: "1.0.0"
+
+  # ── Module B: AI Extraction + DealRanker Pipeline ─────────
+
+  pipeline:
+    build:
+      context: ./modules/pipeline
+      dockerfile: Dockerfile
+    container_name: hunter-pipeline
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP: hunter-pipeline-consumers
+      POSTGRES_URL: postgresql://hunter:${POSTGRES_PASSWORD:-hunter_dev_pw}@postgres:5432/hunter_db
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Swap for GPT-4o: set OPENAI_API_KEY and update LLM_PROVIDER
+      LLM_PROVIDER: claude
+      LLM_MODEL: claude-sonnet-4-5
+      EXTRACTION_CONCURRENCY: "4"
+      ORCHESTRA_TRIGGER_SCORE: "850"
+      ORCHESTRA_WEBHOOK_URL: http://dashboard:3004/webhooks/orchestra
+      ORCHESTRA_WEBHOOK_SECRET: ${ORCHESTRA_WEBHOOK_SECRET:-dev_secret_change_me}
+      LOG_LEVEL: debug
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./modules/pipeline:/app
+      - ./shared:/app/shared:ro
+      - /app/node_modules
+    networks:
+      - hunter-net
+    restart: unless-stopped
+    labels:
+      hunter.module: "pipeline"
+      hunter.version: "1.0.0"
+
+  # ── Module C: Escrow & Settlement Gateway ─────────────────
+
+  gateway:
+    build:
+      context: ./modules/gateway
+      dockerfile: Dockerfile
+    container_name: hunter-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      POSTGRES_URL: postgresql://hunter:${POSTGRES_PASSWORD:-hunter_dev_pw}@postgres:5432/hunter_db
+      REDIS_URL: redis://redis:6379
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      TITAN_MULTISIG_SECRET: ${TITAN_MULTISIG_SECRET:-dev_multisig_secret}
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_prod}
+      PLATFORM_FEE_PERCENT: "1"
+      ESCROW_DEFAULT_EXPIRY_DAYS: "30"
+      LOG_LEVEL: debug
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./modules/gateway:/app
+      - ./shared:/app/shared:ro
+      - /app/node_modules
+    networks:
+      - hunter-net
+    restart: unless-stopped
+    labels:
+      hunter.module: "gateway"
+      hunter.version: "1.0.0"
+
+  # ── Module D: Orchestra Dashboard ─────────────────────────
+
+  dashboard:
+    build:
+      context: ./modules/dashboard
+      dockerfile: Dockerfile
+    container_name: hunter-dashboard
+    depends_on:
+      - kafka
+      - postgres
+      - redis
+      - crawler
+      - pipeline
+      - gateway
+    environment:
+      NODE_ENV: development
+      PORT: 3004
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP: hunter-dashboard-consumers
+      POSTGRES_URL: postgresql://hunter:${POSTGRES_PASSWORD:-hunter_dev_pw}@postgres:5432/hunter_db
+      REDIS_URL: redis://redis:6379
+      DOCKER_SOCKET: /var/run/docker.sock
+      ORCHESTRA_WEBHOOK_SECRET: ${ORCHESTRA_WEBHOOK_SECRET:-dev_secret_change_me}
+      HEALTH_POLL_INTERVAL_MS: "15000"
+      METRICS_WINDOW_MINUTES: "60"
+      LOG_LEVEL: debug
+    ports:
+      - "3004:3004"
+      - "3005:3005"   # WebSocket for real-time dashboard push
+    volumes:
+      - ./modules/dashboard:/app
+      - ./shared:/app/shared:ro
+      - /app/node_modules
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # container health reads
+    networks:
+      - hunter-net
+    restart: unless-stopped
+    labels:
+      hunter.module: "dashboard"
+      hunter.version: "1.0.0"
+
+  # ── Nginx Reverse Proxy ────────────────────────────────────
+
+  nginx:
+    image: nginx:alpine
+    container_name: hunter-nginx
+    depends_on:
+      - crawler
+      - pipeline
+      - gateway
+      - dashboard
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - hunter-net
+    restart: unless-stopped

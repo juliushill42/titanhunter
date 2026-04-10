@@ -1,0 +1,123 @@
+# ============================================================
+# Hunter Adapter Configs — Plug-and-Play Market Adapters
+# Add a new market by adding a new entry here.
+# No code changes required for CSS-selector-based markets.
+# ============================================================
+
+adapters:
+
+  # ── MLS: Generic RETS/IDX feed ───────────────────────────
+  - id: mls-national-v1
+    market: MLS
+    name: "National MLS (IDX)"
+    version: "1.0.0"
+    baseUrl: "https://your-mls-provider.com"
+    searchUrl: "https://your-mls-provider.com/search"
+    rateLimit:
+      requestsPerMinute: 30
+      requestsPerHour: 500
+      delayBetweenRequestsMs: 2000
+      jitterMs: 1000
+    selectors:
+      listingContainer: ".property-card a.listing-link"
+      address: ".property-address"
+      price: ".listing-price"
+      beds: ".beds-count"
+      baths: ".baths-count"
+      sqft: ".sqft-value"
+      daysOnMarket: ".dom-badge"
+      agentName: ".agent-name"
+      agentPhone: ".agent-phone"
+      mlsId: "[data-mls-id]"
+      nextPage: ".pagination-next"
+      totalCount: ".results-count"
+    pagination:
+      type: URL_PARAM
+      paramName: page
+      pageSize: 25
+      maxPages: 40
+    auth:
+      type: API_KEY
+      credentials:
+        envKey: MLS_API_KEY
+    headers:
+      Accept: "text/html,application/xhtml+xml"
+
+  # ── County Records: Property Appraiser API ───────────────
+  - id: county-records-v1
+    market: COUNTY_RECORDS
+    name: "County Property Appraiser (REST API)"
+    version: "1.0.0"
+    baseUrl: "https://your-county-api.gov"
+    searchUrl: "https://your-county-api.gov/v2/properties/search"
+    rateLimit:
+      requestsPerMinute: 60
+      requestsPerHour: 1000
+      delayBetweenRequestsMs: 1000
+      jitterMs: 500
+    selectors:
+      listingContainer: "properties[*]"  # JSON path — adapter parses directly
+    pagination:
+      type: OFFSET
+      pageSize: 100
+      maxPages: 50
+    auth:
+      type: API_KEY
+      credentials:
+        envKey: COUNTY_API_KEY
+    headers:
+      Content-Type: "application/json"
+
+  # ── Zillow (Playwright-scraped) ──────────────────────────
+  - id: zillow-v1
+    market: ZILLOW
+    name: "Zillow (Playwright)"
+    version: "1.0.0"
+    baseUrl: "https://www.zillow.com"
+    searchUrl: "https://www.zillow.com/homes/for_sale/"
+    rateLimit:
+      requestsPerMinute: 10      # Aggressive anti-bot — keep slow
+      requestsPerHour: 100
+      delayBetweenRequestsMs: 8000
+      jitterMs: 4000
+    selectors:
+      listingContainer: "[data-test='property-card'] a"
+      address: "[data-test='property-card-addr']"
+      price: "[data-test='property-card-price']"
+      beds: "[data-test='beds-baths-item']:first-child"
+    pagination:
+      type: URL_PARAM
+      paramName: searchQueryState
+      pageSize: 40
+      maxPages: 20
+    proxy:
+      enabled: true
+      rotationStrategy: ROUND_ROBIN
+      proxyListEnvKey: PROXY_LIST
+
+  # ── LoopNet (Commercial) ─────────────────────────────────
+  - id: loopnet-commercial-v1
+    market: LOOPNET
+    name: "LoopNet Commercial"
+    version: "1.0.0"
+    baseUrl: "https://www.loopnet.com"
+    searchUrl: "https://www.loopnet.com/search/commercial-real-estate/usa/for-sale/"
+    rateLimit:
+      requestsPerMinute: 15
+      requestsPerHour: 200
+      delayBetweenRequestsMs: 4000
+      jitterMs: 2000
+    selectors:
+      listingContainer: ".placard-content a.placard-image-link"
+      address: ".placard-address"
+      price: ".placard-price"
+      sqft: ".placard-details .sqft"
+    pagination:
+      type: URL_PARAM
+      paramName: pg
+      pageSize: 25
+      maxPages: 20
+    proxy:
+      enabled: true
+      rotationStrategy: RANDOM
+      proxyListEnvKey: PROXY_LIST

@@ -1,0 +1,119 @@
+# ============================================================
+# Hunter — K8s Crawler Deployment
+# "Spawning 43 markets = 43 containers"
+# Orchestra manages auto-scaling via HPA
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hunter-crawler
+  namespace: hunter
+  labels:
+    app: hunter-crawler
+    module: crawler
+    version: "1.0.0"
+spec:
+  replicas: 1  # Orchestra scales this per market
+  selector:
+    matchLabels:
+      app: hunter-crawler
+  template:
+    metadata:
+      labels:
+        app: hunter-crawler
+        module: crawler
+    spec:
+      containers:
+        - name: crawler
+          image: titanuai/hunter-crawler:latest
+          ports:
+            - containerPort: 3001
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-config
+                  key: KAFKA_BROKERS
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-secrets
+                  key: POSTGRES_URL
+            - name: COUNTY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-secrets
+                  key: COUNTY_API_KEY
+            - name: MARKET_REGION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['hunter.io/market-region']
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      restartPolicy: Always
+
+---
+# Horizontal Pod Autoscaler — Orchestra's load balancer
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hunter-crawler-hpa
+  namespace: hunter
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hunter-crawler
+  minReplicas: 1
+  maxReplicas: 50  # "43 markets = 43 containers" + headroom
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: hunter.raw.leads
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hunter-crawler-svc
+  namespace: hunter
+spec:
+  selector:
+    app: hunter-crawler
+  ports:
+    - port: 3001
+      targetPort: 3001
+  type: ClusterIP
